@@ -37,15 +37,55 @@ extension.
 
 ## Install from source
 
-Targets GNOME Shell 46+ (see `metadata.json`).
+Requires GNOME Shell 46 or newer (see `shell-version` in `metadata.json`), `git`, and
+`glib-compile-schemas` (package `libglib2.0-bin` on Ubuntu/Debian).
+
+This fork keeps the upstream `uuid` (`clipboard-history@alexsaveau.dev`), so the upstream extension
+must not be installed at the same time. If you have it, disable and remove it first:
 
 ```shell
-git clone https://github.com/todouu/clipboard-history.git \
+gnome-extensions disable clipboard-history@alexsaveau.dev
+rm -rf ~/.local/share/gnome-shell/extensions/clipboard-history@alexsaveau.dev
+```
+
+(Extensions installed system-wide under `/usr/share/gnome-shell/extensions/` have to be removed
+with your package manager instead.)
+
+Install this fork:
+
+```shell
+git clone https://github.com/todouu/clipboard-history-plus.git \
   ~/.local/share/gnome-shell/extensions/clipboard-history@alexsaveau.dev
 cd ~/.local/share/gnome-shell/extensions/clipboard-history@alexsaveau.dev
 glib-compile-schemas schemas/
+```
+
+`schemas/gschemas.compiled` is a build artifact and is not committed, so the
+`glib-compile-schemas` step is required; without it the extension fails to load its settings.
+
+### Restart GNOME Shell
+
+GNOME Shell only discovers newly installed extensions at startup:
+
+- X11: press <kbd>Alt</kbd> + <kbd>F2</kbd>, type `r`, press <kbd>Enter</kbd>.
+- Wayland: log out and back in.
+
+### Enable
+
+```shell
 gnome-extensions enable clipboard-history@alexsaveau.dev
 ```
 
-Then restart GNOME Shell: on X11 press <kbd>Alt</kbd> + <kbd>F2</kbd>, type `r`; on Wayland log out
-and back in. Re-run `glib-compile-schemas schemas/` after changing the schema XML.
+Then open the extension settings (`gnome-extensions prefs clipboard-history@alexsaveau.dev`) and
+assign a key to "Toggle the menu at mouse pointer" if you want the pointer-anchored panel.
+
+### Update
+
+```shell
+cd ~/.local/share/gnome-shell/extensions/clipboard-history@alexsaveau.dev
+git pull
+glib-compile-schemas schemas/
+```
+
+Then restart GNOME Shell as above. Re-run `glib-compile-schemas schemas/` whenever the schema XML
+changes.
