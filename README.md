@@ -13,6 +13,11 @@ Licensed under MIT; original copyright notices are kept in `LICENSE`.
   instead of the top bar.
 - The pointer-anchored menu is height-capped to the larger free side of the pointer so it flips
   above/below the pointer instead of covering the whole work area.
+- Images (PNG) are saved to the history alongside text, with a thumbnail in the menu. Blobs live in
+  `~/.cache/clipboard-history-plus@todou.local/images/<sha256>.png`; the log only stores the hash
+  and dimensions. Identical images are deduplicated. When the clipboard offers both text and an
+  image, only the text is saved. Two new settings cap the size of a single image and the total
+  image cache. Selecting an image entry puts it back on the clipboard as `image/png`.
 
 Everything else is unchanged from upstream. The extension `uuid` is changed to
 `clipboard-history-plus@todou.local`, so the upstream extension (and its updates from

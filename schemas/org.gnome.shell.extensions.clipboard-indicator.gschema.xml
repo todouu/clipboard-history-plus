@@ -148,5 +148,24 @@
         If true, typing in the open menu focuses the search entry and appends typed characters.
       </description>
     </key>
+
+    <key type="i" name="max-image-size">
+      <default>10</default>
+      <summary>The maximum size of a single saved image (MiB)</summary>
+      <description>
+        Copied PNG images larger than this are ignored.
+      </description>
+      <range min="1" max="256" />
+    </key>
+
+    <key type="i" name="image-cache-size">
+      <default>200</default>
+      <summary>The maximum total size of saved images (MiB)</summary>
+      <description>
+        When the images in the history add up to more than this, the oldest images are removed.
+        This limit is separate from cache-size, which only applies to text.
+      </description>
+      <range min="1" max="4096" />
+    </key>
   </schema>
 </schemalist>

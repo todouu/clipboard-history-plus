@@ -4,6 +4,9 @@ import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
+import Cogl from 'gi://Cogl';
+import GdkPixbuf from 'gi://GdkPixbuf';
+import Gio from 'gi://Gio';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
@@ -47,6 +50,19 @@ const POINTER_MENU_MARGIN = 48;
 
 const PAGE_SIZE = 50;
 const MAX_VISIBLE_CHARS = 200;
+const IMAGE_MIMETYPE = 'image/png';
+// The mimetypes St.Clipboard.get_text() understands. If none is offered, the clipboard has no text.
+const TEXT_MIMETYPES = [
+  'text/plain;charset=utf-8',
+  'UTF8_STRING',
+  'text/plain',
+  'STRING',
+];
+// Thumbnails are decoded at twice the logical size of .ci-image-thumbnail so they stay sharp on
+// HiDPI screens.
+const THUMBNAIL_WIDTH = 192;
+const THUMBNAIL_HEIGHT = 96;
+const THUMBNAIL_CACHE_SIZE = 100;
 
 let MAX_REGISTRY_LENGTH;
 let MAX_BYTES;
@@ -65,6 +81,36 @@ let PASTE_ON_SELECTION;
 let PROCESS_PRIMARY_SELECTION;
 let IGNORE_PASSWORD_MIMES;
 let ENABLE_TYPEAHEAD_SEARCH;
+let MAX_IMAGE_BYTES;
+let MAX_IMAGE_CACHE_BYTES;
+
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+// Signature, IHDR chunk length and type, then the IHDR width and height.
+const PNG_HEADER_SIZE = 24;
+
+/** Reads the dimensions from the IHDR chunk without decoding. Null if `bytes` isn't a PNG. */
+function readPngDimensions(bytes) {
+  if (bytes.get_size() < PNG_HEADER_SIZE) {
+    return null;
+  }
+
+  const header = bytes.get_data().subarray(0, PNG_HEADER_SIZE);
+  if (!PNG_SIGNATURE.every((byte, i) => header[i] === byte)) {
+    return null;
+  }
+  if (String.fromCharCode(...header.subarray(12, 16)) !== 'IHDR') {
+    return null;
+  }
+
+  const view = new DataView(
+    header.buffer,
+    header.byteOffset,
+    header.byteLength,
+  );
+  const width = view.getUint32(16);
+  const height = view.getUint32(20);
+  return width > 0 && height > 0 ? { width, height } : null;
+}
 
 class ClipboardIndicator extends PanelMenu.Button {
   _init(extension) {
@@ -72,6 +118,9 @@ class ClipboardIndicator extends PanelMenu.Button {
 
     this.extension = extension;
     this.settings = extension.getSettings();
+    this._thumbnails = new Map();
+    // Cancelled on destroy: stops thumbnail decoding and marks pending async callbacks as stale.
+    this._cancellable = new Gio.Cancellable();
 
     this._shortcutsBindingIds = [];
     this._pointerAnchor = new St.Widget({
@@ -109,6 +158,8 @@ class ClipboardIndicator extends PanelMenu.Button {
     this._disconnectSettings();
     this._unbindShortcuts();
     this._disconnectSelectionListener();
+    this._cancellable.cancel();
+    this._thumbnails.clear();
 
     if (this._searchFocusHackCallbackId) {
       GLib.Source.source_remove(this._searchFocusHackCallbackId);
@@ -506,6 +557,7 @@ class ClipboardIndicator extends PanelMenu.Button {
 
     menuItem.connect('destroy', () => {
       delete menuItem.entry.menuItem;
+      menuItem.thumbnail = null;
       if (!menuItem.entry.favorite) {
         this.activeHistoryMenuItems--;
       }
@@ -543,17 +595,15 @@ class ClipboardIndicator extends PanelMenu.Button {
   }
 
   _updateButtonText(entry) {
-    if (
-      !(TOPBAR_DISPLAY_MODE === 1 || TOPBAR_DISPLAY_MODE === 2) ||
-      (entry && entry.type !== DS.TYPE_TEXT)
-    ) {
+    if (!(TOPBAR_DISPLAY_MODE === 1 || TOPBAR_DISPLAY_MODE === 2)) {
       return;
     }
 
     if (PRIVATE_MODE) {
       this._buttonText.set_text('…');
     } else if (entry) {
-      this._buttonText.set_text(this._truncated(entry.text, MAX_TOPBAR_LENGTH));
+      const text = entry.type === DS.TYPE_TEXT ? entry.text : _('Image');
+      this._buttonText.set_text(this._truncated(text, MAX_TOPBAR_LENGTH));
     } else {
       this._buttonText.set_text('');
     }
@@ -562,10 +612,106 @@ class ClipboardIndicator extends PanelMenu.Button {
   _setEntryLabel(menuItem) {
     const entry = menuItem.entry;
     if (entry.type === DS.TYPE_TEXT) {
+      if (menuItem.thumbnail) {
+        menuItem.thumbnail.content = null;
+        menuItem.thumbnail.hide();
+      }
       menuItem.label.set_text(this._truncated(entry.text, MAX_VISIBLE_CHARS));
+    } else if (entry.type === DS.TYPE_IMAGE) {
+      menuItem.label.set_text(this._imageLabel(entry));
+      this._showThumbnail(menuItem, entry);
     } else {
       throw new TypeError('Unknown type: ' + entry.type);
     }
+  }
+
+  _imageLabel(entry) {
+    return `${_('Image')} ${entry.width}×${entry.height} · ${GLib.format_size(entry.size)}`;
+  }
+
+  _showThumbnail(menuItem, entry) {
+    let thumbnail = menuItem.thumbnail;
+    if (!thumbnail) {
+      thumbnail = new St.Widget({
+        style_class: 'ci-image-thumbnail',
+        y_align: Clutter.ActorAlign.CENTER,
+        content_gravity: Clutter.ContentGravity.RESIZE_ASPECT,
+      });
+      menuItem.insert_child_below(thumbnail, menuItem.label);
+      menuItem.thumbnail = thumbnail;
+    }
+    thumbnail.show();
+    thumbnail.content = null;
+
+    this._loadThumbnail(entry, (content) => {
+      // The menu item may have been destroyed or reused for another entry while we were decoding.
+      if (menuItem.thumbnail === thumbnail && menuItem.entry === entry) {
+        thumbnail.content = content;
+      }
+    });
+  }
+
+  /** Calls `callback` with Clutter content for the entry's thumbnail, or null if it can't be built. */
+  _loadThumbnail(entry, callback) {
+    const cached = this._thumbnails.get(entry.hash);
+    if (cached) {
+      // Re-insert so the least recently used thumbnail is the first key.
+      this._thumbnails.delete(entry.hash);
+      this._thumbnails.set(entry.hash, cached);
+      callback(cached);
+      return;
+    }
+
+    this._withImageBytes(entry, (bytes) => {
+      if (this._cancellable.is_cancelled()) {
+        return;
+      }
+      if (!bytes) {
+        callback(null);
+        return;
+      }
+
+      // Decoded on a worker thread so big screenshots don't stall the shell.
+      GdkPixbuf.Pixbuf.new_from_stream_at_scale_async(
+        Gio.MemoryInputStream.new_from_bytes(bytes),
+        THUMBNAIL_WIDTH,
+        THUMBNAIL_HEIGHT,
+        true,
+        this._cancellable,
+        (_source, res) => {
+          let content = null;
+          try {
+            const pixbuf = GdkPixbuf.Pixbuf.new_from_stream_finish(res);
+            const width = pixbuf.get_width();
+            const height = pixbuf.get_height();
+            content = St.ImageContent.new_with_preferred_size(width, height);
+            content.set_bytes(
+              pixbuf.read_pixel_bytes(),
+              pixbuf.get_has_alpha()
+                ? Cogl.PixelFormat.RGBA_8888
+                : Cogl.PixelFormat.RGB_888,
+              width,
+              height,
+              pixbuf.get_rowstride(),
+            );
+          } catch (e) {
+            content = null;
+            if (this._cancellable.is_cancelled()) {
+              return;
+            }
+            console.error(e);
+          }
+
+          if (content) {
+            this._thumbnails.set(entry.hash, content);
+            if (this._thumbnails.size > THUMBNAIL_CACHE_SIZE) {
+              this._thumbnails.delete(this._thumbnails.keys().next().value);
+            }
+          }
+          callback(content);
+        },
+      );
+    });
   }
 
   _favoriteToggle(menuItem) {
@@ -582,8 +728,11 @@ class ClipboardIndicator extends PanelMenu.Button {
 
     if (CACHE_ONLY_FAVORITES && !entry.favorite) {
       if (entry.diskId) {
-        Store.deleteTextEntry(entry.diskId, true);
+        Store.deleteEntry(entry.diskId, true);
         delete entry.diskId;
+        if (entry.type === DS.TYPE_IMAGE) {
+          this._moveImageToMemory(entry);
+        }
       }
       return;
     }
@@ -593,7 +742,7 @@ class ClipboardIndicator extends PanelMenu.Button {
     } else {
       entry.diskId = this.nextDiskId++;
 
-      Store.storeTextEntry(entry.text);
+      this._persistEntry(entry);
       Store.updateFavoriteStatus(entry.diskId, true);
     }
   }
@@ -640,7 +789,11 @@ class ClipboardIndicator extends PanelMenu.Button {
       entry.detach();
 
       if (entry.diskId) {
-        Store.deleteTextEntry(entry.diskId, entry.favorite);
+        Store.deleteEntry(entry.diskId, entry.favorite);
+      }
+      if (entry.type === DS.TYPE_IMAGE) {
+        Store.deleteImageBlob(entry.hash);
+        this._thumbnails.delete(entry.hash);
       }
     }
 
@@ -655,13 +808,23 @@ class ClipboardIndicator extends PanelMenu.Button {
 
   _pruneOldestEntries() {
     let entry = this.entries.head;
-    while (
-      entry &&
-      (this.entries.length > MAX_REGISTRY_LENGTH ||
-        this.entries.bytes > MAX_BYTES)
-    ) {
+    while (entry) {
+      const overCount = this.entries.length > MAX_REGISTRY_LENGTH;
+      const overText = this.entries.bytes > MAX_BYTES;
+      const overImages = this.entries.imageBytes > MAX_IMAGE_CACHE_BYTES;
+      if (!overCount && !overText && !overImages) {
+        break;
+      }
+
       const next = entry.next;
-      this._removeEntry(entry, true);
+      // Text and images have separate byte budgets, so only evict the type that is over its own.
+      if (
+        overCount ||
+        (overText && entry.type === DS.TYPE_TEXT) ||
+        (overImages && entry.type === DS.TYPE_IMAGE)
+      ) {
+        this._removeEntry(entry, true);
+      }
       entry = next;
     }
 
@@ -675,14 +838,16 @@ class ClipboardIndicator extends PanelMenu.Button {
     entry.menuItem?.setOrnament(PopupMenu.Ornament.DOT);
     this._updateButtonText(entry);
     if (updateClipboard !== false) {
+      const paste = PASTE_ON_SELECTION && triggerPaste;
       if (entry.type === DS.TYPE_TEXT) {
         this._setClipboardText(entry.text);
+        if (paste) {
+          this._triggerPasteHack();
+        }
+      } else if (entry.type === DS.TYPE_IMAGE) {
+        this._restoreImageToClipboard(entry, paste);
       } else {
         throw new TypeError('Unknown type: ' + entry.type);
-      }
-
-      if (PASTE_ON_SELECTION && triggerPaste) {
-        this._triggerPasteHack();
       }
     }
   }
@@ -694,6 +859,105 @@ class ClipboardIndicator extends PanelMenu.Button {
 
     Clipboard.set_text(St.ClipboardType.CLIPBOARD, text);
     Clipboard.set_text(St.ClipboardType.PRIMARY, text);
+  }
+
+  /** Calls `callback` with the image's PNG bytes: from memory if held, else from disk (null if unreadable). */
+  _withImageBytes(entry, callback) {
+    if (entry.bytes) {
+      callback(entry.bytes);
+    } else {
+      Store.loadImageBytes(entry.hash, callback);
+    }
+  }
+
+  _restoreImageToClipboard(entry, triggerPaste) {
+    this._withImageBytes(entry, (bytes) => {
+      // The user may have picked another entry while the blob was loading.
+      if (
+        this._cancellable.is_cancelled() ||
+        this.currentlySelectedEntry !== entry
+      ) {
+        return;
+      }
+      if (!bytes) {
+        console.log(
+          this.extension.uuid,
+          'Image data is unavailable:',
+          entry.hash,
+        );
+        return;
+      }
+
+      this._setClipboardImage(bytes);
+      if (triggerPaste) {
+        this._triggerPasteHack();
+      }
+    });
+  }
+
+  _setClipboardImage(bytes) {
+    if (this._debouncing !== undefined) {
+      this._debouncing++;
+    }
+
+    Clipboard.set_content(St.ClipboardType.CLIPBOARD, IMAGE_MIMETYPE, bytes);
+  }
+
+  /**
+   * Appends the entry to the log. Image blobs are written first and then released from memory,
+   * unless the entry is memory-only (non-favorite while only favorites are cached).
+   */
+  _persistEntry(entry) {
+    if (entry.type === DS.TYPE_TEXT) {
+      Store.storeTextEntry(entry.text);
+    } else if (entry.type === DS.TYPE_IMAGE) {
+      Store.storeImageEntry(entry, entry.bytes, (ok) => {
+        if (ok && entry.diskId && (entry.favorite || !CACHE_ONLY_FAVORITES)) {
+          delete entry.bytes;
+        }
+      });
+    } else {
+      throw new TypeError('Unknown type: ' + entry.type);
+    }
+  }
+
+  /** The entry just left the disk cache: keep its PNG in memory, then drop the blob. */
+  _moveImageToMemory(entry) {
+    this._withImageBytes(entry, (bytes) => {
+      if (bytes) {
+        entry.bytes = bytes;
+      }
+      // Skip if the user re-favorited the entry meanwhile: its blob is needed again.
+      if (entry.diskId === undefined) {
+        Store.deleteImageBlob(entry.hash);
+      }
+    });
+  }
+
+  /** Calls `done` once every non-favorite image is in memory, so their blobs can be deleted. */
+  _holdImagesInMemory(done) {
+    const missing = [];
+    for (const entry of this.entries) {
+      if (entry.type === DS.TYPE_IMAGE && !entry.bytes) {
+        missing.push(entry);
+      }
+    }
+
+    let remaining = missing.length;
+    if (remaining === 0) {
+      done();
+      return;
+    }
+    for (const entry of missing) {
+      Store.loadImageBytes(entry.hash, (bytes) => {
+        if (bytes) {
+          entry.bytes = bytes;
+        }
+        if (--remaining === 0) {
+          done();
+        }
+      });
+    }
   }
 
   _triggerPasteHack() {
@@ -823,6 +1087,12 @@ class ClipboardIndicator extends PanelMenu.Button {
   }
 
   _rewriteMenuItem(item, entry) {
+    // The previous entry must stop pointing at this item. Otherwise removing it later (e.g. pruning
+    // the oldest entry) destroys the item that now displays `entry`.
+    if (item.entry.menuItem === item) {
+      delete item.entry.menuItem;
+    }
+
     if (item.entry.id === this.currentlySelectedEntry?.id) {
       item.setOrnament(PopupMenu.Ornament.NONE);
     }
@@ -894,6 +1164,20 @@ class ClipboardIndicator extends PanelMenu.Button {
             ),
           );
         }
+      } else if (entry.type === DS.TYPE_IMAGE) {
+        // Images are searchable by their label, e.g. "Image 1920×1080".
+        const label = this._imageLabel(entry);
+        if (
+          label.toLowerCase().includes(query) ||
+          (searchExp && label.search(searchExp) >= 0)
+        ) {
+          this._addEntry(
+            entry,
+            entry === this.currentlySelectedEntry,
+            false,
+            forward ? undefined : 0,
+          );
+        }
       } else {
         throw new TypeError('Unknown type: ' + entry.type);
       }
@@ -938,9 +1222,38 @@ class ClipboardIndicator extends PanelMenu.Button {
       return;
     }
 
+    // Text wins when both are offered: spreadsheets and rich-text editors put a rendered PNG next
+    // to the text, and the text is what the user wants there.
+    const mimetypes = Clipboard.get_mimetypes(St.ClipboardType.CLIPBOARD);
+    if (
+      !mimetypes.some((mimetype) => TEXT_MIMETYPES.includes(mimetype)) &&
+      mimetypes.includes(IMAGE_MIMETYPE)
+    ) {
+      this._queryClipboardImage();
+      return;
+    }
+
     Clipboard.get_text(St.ClipboardType.CLIPBOARD, (_, text) => {
       this._processClipboardContent(text, true);
     });
+  }
+
+  _queryClipboardImage() {
+    // Ignore the change we caused ourselves by restoring an entry.
+    if (this._debouncing > 0) {
+      this._debouncing--;
+      return;
+    }
+
+    Clipboard.get_content(
+      St.ClipboardType.CLIPBOARD,
+      IMAGE_MIMETYPE,
+      (_, bytes) => {
+        if (!this._cancellable.is_cancelled()) {
+          this._processClipboardImage(bytes);
+        }
+      },
+    );
   }
 
   _queryPrimaryClipboard() {
@@ -953,6 +1266,7 @@ class ClipboardIndicator extends PanelMenu.Button {
       text = this._processClipboardContent(text, false);
       if (
         last &&
+        last.type === DS.TYPE_TEXT &&
         text &&
         text.length !== last.text.length &&
         (text.endsWith(last.text) ||
@@ -982,14 +1296,7 @@ class ClipboardIndicator extends PanelMenu.Button {
       this.entries.findTextItem(text) ||
       this.favoriteEntries.findTextItem(text);
     if (entry) {
-      const isFirst =
-        entry === this.entries.last() || entry === this.favoriteEntries.last();
-      if (!isFirst) {
-        this._moveEntryFirst(entry);
-      }
-      if (selectEntry && (!isFirst || entry !== this.currentlySelectedEntry)) {
-        this._selectEntry(entry, false);
-      }
+      this._reuseEntry(entry, selectEntry);
     } else {
       entry = new DS.LLNode();
       entry.id = this.nextId++;
@@ -1006,15 +1313,80 @@ class ClipboardIndicator extends PanelMenu.Button {
       this._pruneOldestEntries();
     }
 
-    if (NOTIFY_ON_COPY) {
-      this._showNotification(_('Copied to clipboard'), null, (notif) => {
-        notif.addAction(_('Cancel'), () =>
-          this._deleteEntryAndRestoreLatest(this.currentlySelectedEntry),
-        );
-      });
-    }
+    this._notifyCopied();
 
     return text;
+  }
+
+  _processClipboardImage(bytes) {
+    if (!bytes || bytes.get_size() === 0) {
+      return;
+    }
+    if (bytes.get_size() > MAX_IMAGE_BYTES) {
+      console.log(this.extension.uuid, 'Ignoring image over the size limit.');
+      return;
+    }
+
+    const dimensions = readPngDimensions(bytes);
+    if (!dimensions) {
+      console.log(this.extension.uuid, 'Ignoring image that is not a PNG.');
+      return;
+    }
+
+    const hash = GLib.compute_checksum_for_bytes(
+      GLib.ChecksumType.SHA256,
+      bytes,
+    );
+    let entry =
+      this.entries.findImageItem(hash) ||
+      this.favoriteEntries.findImageItem(hash);
+    if (entry) {
+      this._reuseEntry(entry, true);
+    } else {
+      entry = new DS.LLNode();
+      entry.id = this.nextId++;
+      entry.diskId = CACHE_ONLY_FAVORITES ? undefined : this.nextDiskId++;
+      entry.type = DS.TYPE_IMAGE;
+      entry.hash = hash;
+      entry.size = bytes.get_size();
+      entry.width = dimensions.width;
+      entry.height = dimensions.height;
+      entry.bytes = bytes;
+      entry.favorite = false;
+      this.entries.append(entry);
+      this._addEntry(entry, true, false, 0);
+
+      if (!CACHE_ONLY_FAVORITES) {
+        this._persistEntry(entry);
+      }
+      this._pruneOldestEntries();
+    }
+
+    this._notifyCopied();
+  }
+
+  /** An already-known entry was copied again: bring it to the front and mark it selected. */
+  _reuseEntry(entry, selectEntry) {
+    const isFirst =
+      entry === this.entries.last() || entry === this.favoriteEntries.last();
+    if (!isFirst) {
+      this._moveEntryFirst(entry);
+    }
+    if (selectEntry && (!isFirst || entry !== this.currentlySelectedEntry)) {
+      this._selectEntry(entry, false);
+    }
+  }
+
+  _notifyCopied() {
+    if (!NOTIFY_ON_COPY) {
+      return;
+    }
+
+    this._showNotification(_('Copied to clipboard'), null, (notif) => {
+      notif.addAction(_('Cancel'), () =>
+        this._deleteEntryAndRestoreLatest(this.currentlySelectedEntry),
+      );
+    });
   }
 
   _moveEntryFirst(entry) {
@@ -1214,6 +1586,10 @@ class ClipboardIndicator extends PanelMenu.Button {
     ENABLE_TYPEAHEAD_SEARCH = this.settings.get_boolean(
       SettingsFields.ENABLE_TYPEAHEAD_SEARCH,
     );
+    MAX_IMAGE_BYTES =
+      (1 << 20) * this.settings.get_int(SettingsFields.MAX_IMAGE_SIZE);
+    MAX_IMAGE_CACHE_BYTES =
+      (1 << 20) * this.settings.get_int(SettingsFields.IMAGE_CACHE_SIZE);
   }
 
   _onSettingsChange() {
@@ -1227,11 +1603,16 @@ class ClipboardIndicator extends PanelMenu.Button {
       CACHE_ONLY_FAVORITES !== prevCacheOnlyFavorites
     ) {
       if (CACHE_ONLY_FAVORITES) {
-        Store.resetDatabase(this._currentStateBuilder.bind(this));
+        // Non-favorite images must be in memory before the reset deletes their blobs.
+        this._holdImagesInMemory(() => {
+          if (CACHE_ONLY_FAVORITES && !this._cancellable.is_cancelled()) {
+            Store.resetDatabase(this._currentStateBuilder.bind(this));
+          }
+        });
       } else {
         for (const entry of this.entries) {
           entry.diskId = this.nextDiskId++;
-          Store.storeTextEntry(entry.text);
+          this._persistEntry(entry);
         }
       }
     }
@@ -1418,9 +1799,10 @@ class ClipboardIndicator extends PanelMenu.Button {
     }
 
     this._selectEntry(entry, true);
-    if (entry.type === DS.TYPE_TEXT) {
-      this._showNotification(_('Copied'), entry.text);
-    }
+    this._showNotification(
+      _('Copied'),
+      entry.type === DS.TYPE_TEXT ? entry.text : this._imageLabel(entry),
+    );
   }
 
   _truncated(s, start, end) {

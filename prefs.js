@@ -50,6 +50,20 @@ export default class ClipboardHistoryPrefs extends ExtensionPreferences {
         step_increment: 5,
       }),
     });
+    const field_max_image_size = new Gtk.SpinButton({
+      adjustment: new Gtk.Adjustment({
+        lower: 1,
+        upper: 256,
+        step_increment: 1,
+      }),
+    });
+    const field_image_cache_size = new Gtk.SpinButton({
+      adjustment: new Gtk.Adjustment({
+        lower: 1,
+        upper: 4096,
+        step_increment: 50,
+      }),
+    });
     const field_topbar_preview_size = new Gtk.SpinButton({
       adjustment: new Gtk.Adjustment({
         lower: 1,
@@ -129,6 +143,16 @@ export default class ClipboardHistoryPrefs extends ExtensionPreferences {
     });
     const cacheSizeLabel = new Gtk.Label({
       label: _('Max clipboard history size (MiB)'),
+      hexpand: true,
+      halign: Gtk.Align.START,
+    });
+    const maxImageSizeLabel = new Gtk.Label({
+      label: _('Max size of a single image (MiB)'),
+      hexpand: true,
+      halign: Gtk.Align.START,
+    });
+    const imageCacheSizeLabel = new Gtk.Label({
+      label: _('Max total size of saved images (MiB)'),
       hexpand: true,
       halign: Gtk.Align.START,
     });
@@ -224,6 +248,8 @@ export default class ClipboardHistoryPrefs extends ExtensionPreferences {
     addRow(windowWidthPercentageLabel, window_width_percentage);
     addRow(sizeLabel, field_size);
     addRow(cacheSizeLabel, field_cache_size);
+    addRow(maxImageSizeLabel, field_max_image_size);
+    addRow(imageCacheSizeLabel, field_image_cache_size);
     addRow(cacheDisableLabel, field_cache_disable);
     addRow(moveFirstLabel, field_move_item_first);
     addRow(stripTextLabel, field_strip_text);
@@ -254,6 +280,18 @@ export default class ClipboardHistoryPrefs extends ExtensionPreferences {
     settings.bind(
       Fields.CACHE_FILE_SIZE,
       field_cache_size,
+      'value',
+      Gio.SettingsBindFlags.DEFAULT,
+    );
+    settings.bind(
+      Fields.MAX_IMAGE_SIZE,
+      field_max_image_size,
+      'value',
+      Gio.SettingsBindFlags.DEFAULT,
+    );
+    settings.bind(
+      Fields.IMAGE_CACHE_SIZE,
+      field_image_cache_size,
       'value',
       Gio.SettingsBindFlags.DEFAULT,
     );

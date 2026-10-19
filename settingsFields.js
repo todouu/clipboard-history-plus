@@ -16,5 +16,7 @@ const SettingsFields = {
   PROCESS_PRIMARY_SELECTION: 'process-primary-selection',
   IGNORE_PASSWORD_MIMES: 'ignore-password-mimes',
   ENABLE_TYPEAHEAD_SEARCH: 'enable-typeahead-search',
+  MAX_IMAGE_SIZE: 'max-image-size',
+  IMAGE_CACHE_SIZE: 'image-cache-size',
 };
 export default SettingsFields;

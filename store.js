@@ -20,14 +20,19 @@ const OLD_REGISTRY_FILE = GLib.build_filenamev([
  *   on the order in which these add ops are discovered.
  */
 let DATABASE_FILE;
+let IMAGES_DIR;
 const BYTE_ORDER = Gio.DataStreamByteOrder.LITTLE_ENDIAN;
 
 // Don't use zero b/c DataInputStream uses 0 as its error value
 const OP_TYPE_SAVE_TEXT = 1;
-const OP_TYPE_DELETE_TEXT = 2;
+const OP_TYPE_DELETE_ENTRY = 2;
 const OP_TYPE_FAVORITE_ITEM = 3;
 const OP_TYPE_UNFAVORITE_ITEM = 4;
 const OP_TYPE_MOVE_ITEM_TO_END = 5;
+// Layout: op, SHA-256 hex NUL-terminated, then uint32 size, width, height. The PNG itself lives in
+// IMAGES_DIR/<hash>.png so the log stays small and cheap to replay.
+const OP_TYPE_SAVE_IMAGE = 6;
+const IMAGE_HASH_PATTERN = /^[0-9a-f]{64}$/;
 
 const MAX_WASTED_OPS = 500;
 let uselessOpCount;
@@ -40,12 +45,21 @@ export function init(uuid) {
   EXTENSION_UUID = uuid;
   CACHE_DIR = GLib.build_filenamev([GLib.get_user_cache_dir(), EXTENSION_UUID]);
   DATABASE_FILE = GLib.build_filenamev([CACHE_DIR, 'database.log']);
+  IMAGES_DIR = GLib.build_filenamev([CACHE_DIR, 'images']);
 
   if (GLib.mkdir_with_parents(CACHE_DIR, 0o775) !== 0) {
     console.log(
       EXTENSION_UUID,
       "Failed to create cache dir, extension likely won't work",
       CACHE_DIR,
+    );
+  }
+
+  if (GLib.mkdir_with_parents(IMAGES_DIR, 0o700) !== 0) {
+    console.log(
+      EXTENSION_UUID,
+      "Failed to create images dir, images won't be saved",
+      IMAGES_DIR,
     );
   }
 }
@@ -138,7 +152,34 @@ function _consumeStream(stream, state, callback) {
           loop();
         },
       );
-    } else if (opType === OP_TYPE_DELETE_TEXT) {
+    } else if (opType === OP_TYPE_SAVE_IMAGE) {
+      stream.read_upto_async(
+        /*stop_chars=*/ '\0',
+        /*stop_chars_len=*/ 1,
+        0,
+        null,
+        (src, res) => {
+          const [hash] = src.read_upto_finish(res);
+          src.read_byte(null);
+
+          parseAvailableAware(12, () => {
+            if (!IMAGE_HASH_PATTERN.test(hash)) {
+              throw new Error('Invalid image hash: ' + hash);
+            }
+
+            const node = new DS.LLNode();
+            node.diskId = node.id = state.nextId++;
+            node.type = DS.TYPE_IMAGE;
+            node.hash = hash;
+            node.size = stream.read_uint32(null);
+            node.width = stream.read_uint32(null);
+            node.height = stream.read_uint32(null);
+            node.favorite = false;
+            state.entries.append(node);
+          });
+        },
+      );
+    } else if (opType === OP_TYPE_DELETE_ENTRY) {
       uselessOpCount += 2;
       parseAvailableAware(4, () => {
         const id = stream.read_uint32(null);
@@ -311,6 +352,9 @@ export function resetDatabase(currentStateBuilder) {
   uselessOpCount = 0;
 
   const state = currentStateBuilder();
+  const keptImages = new Set(
+    state.filter((e) => e.type === DS.TYPE_IMAGE).map((e) => e.hash),
+  );
   _pushToOpQueue((resolve) => {
     // Sigh, can't use truncate because it doesn't have an async variant. Instead, nuke the stream
     // and let the next append re-create it. Note that we can't use this stream because it tries to
@@ -330,7 +374,7 @@ export function resetDatabase(currentStateBuilder) {
         const finish = () => {
           stream.close_async(priority, null, (src, res) => {
             src.close_finish(res);
-            resolve();
+            _removeUnreferencedImages(keptImages, resolve);
           });
         };
 
@@ -346,6 +390,8 @@ export function resetDatabase(currentStateBuilder) {
 
             if (entry.type === DS.TYPE_TEXT) {
               _storeTextOp(entry.text)(dataStream);
+            } else if (entry.type === DS.TYPE_IMAGE) {
+              _storeImageOp(entry)(dataStream);
             } else {
               throw new TypeError('Unknown type: ' + entry.type);
             }
@@ -377,17 +423,178 @@ function _storeTextOp(text) {
   };
 }
 
-export function deleteTextEntry(id, isFavorite) {
-  _appendBytesToLog(_deleteTextOp(id), 5);
+/**
+ * Writes the PNG blob, then appends the log op. `bytes` may be null if the blob is already on disk.
+ * The log op is appended even when the blob write fails: entry IDs are derived from the order of
+ * add ops, so skipping one would shift every later ID. `onBlobWritten(ok)` lets the caller keep its
+ * in-memory copy until the blob is actually durable.
+ */
+export function storeImageEntry(entry, bytes, onBlobWritten) {
+  _pushToOpQueue((resolve) => {
+    const appendLogOp = () => _runLogAppend(resolve, _storeImageOp(entry), -5);
+    if (!bytes) {
+      appendLogOp();
+      return;
+    }
+
+    imageFile(entry.hash).replace_contents_bytes_async(
+      bytes,
+      /*etag=*/ null,
+      /*make_backup=*/ false,
+      Gio.FileCreateFlags.PRIVATE,
+      null,
+      (src, res) => {
+        let ok = true;
+        try {
+          src.replace_contents_finish(res);
+        } catch (e) {
+          ok = false;
+          console.error(e);
+        }
+        if (onBlobWritten) {
+          onBlobWritten(ok);
+        }
+        appendLogOp();
+      },
+    );
+  });
+}
+
+function _storeImageOp(entry) {
+  return (dataStream) => {
+    dataStream.put_byte(OP_TYPE_SAVE_IMAGE, null);
+    dataStream.put_string(entry.hash, null);
+    dataStream.put_byte(0, null); // NUL terminator
+    dataStream.put_uint32(entry.size, null);
+    dataStream.put_uint32(entry.width, null);
+    dataStream.put_uint32(entry.height, null);
+    return true;
+  };
+}
+
+export function imageFile(hash) {
+  return Gio.File.new_for_path(
+    GLib.build_filenamev([IMAGES_DIR, hash + '.png']),
+  );
+}
+
+/** Calls back with the blob's GLib.Bytes, or null if it can't be read. */
+export function loadImageBytes(hash, callback) {
+  imageFile(hash).load_bytes_async(null, (src, res) => {
+    let bytes = null;
+    try {
+      [bytes] = src.load_bytes_finish(res);
+    } catch (e) {
+      console.error(e);
+    }
+    callback(bytes);
+  });
+}
+
+/** Queued behind pending writes so it can't race the blob's own save. */
+export function deleteImageBlob(hash) {
+  _pushToOpQueue((resolve) => {
+    imageFile(hash).delete_async(GLib.PRIORITY_DEFAULT, null, (src, res) => {
+      try {
+        src.delete_finish(res);
+      } catch (e) {
+        if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) {
+          console.error(e);
+        }
+      }
+      resolve();
+    });
+  });
+}
+
+/** Deletes every file in IMAGES_DIR whose hash isn't in `keep`, then calls `resolve`. */
+function _removeUnreferencedImages(keep, resolve) {
+  const priority = GLib.PRIORITY_LOW;
+  const dir = Gio.File.new_for_path(IMAGES_DIR);
+
+  // Only resolve once every delete finished so a later queued write of the same hash can't be
+  // clobbered by a straggling delete.
+  let pending = 1;
+  const settle = () => {
+    if (--pending === 0) {
+      resolve();
+    }
+  };
+
+  dir.enumerate_children_async(
+    'standard::name',
+    Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+    priority,
+    null,
+    (src, res) => {
+      let enumerator;
+      try {
+        enumerator = src.enumerate_children_finish(res);
+      } catch (e) {
+        if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) {
+          console.error(e);
+        }
+        settle();
+        return;
+      }
+
+      const nextBatch = () => {
+        enumerator.next_files_async(64, priority, null, (src, res) => {
+          let infos = [];
+          try {
+            infos = src.next_files_finish(res);
+          } catch (e) {
+            console.error(e);
+          }
+
+          if (infos.length === 0) {
+            enumerator.close_async(priority, null, (src, res) => {
+              try {
+                src.close_finish(res);
+              } catch (e) {
+                console.error(e);
+              }
+              settle();
+            });
+            return;
+          }
+
+          for (const info of infos) {
+            const name = info.get_name();
+            const hash = name.endsWith('.png') ? name.slice(0, -4) : name;
+            if (keep.has(hash)) {
+              continue;
+            }
+
+            pending++;
+            dir.get_child(name).delete_async(priority, null, (file, res) => {
+              try {
+                file.delete_finish(res);
+              } catch (e) {
+                console.error(e);
+              }
+              settle();
+            });
+          }
+          nextBatch();
+        });
+      };
+      nextBatch();
+    },
+  );
+}
+
+export function deleteEntry(id, isFavorite) {
+  _appendBytesToLog(_deleteOp(id), 5);
   uselessOpCount += 2;
   if (isFavorite) {
     uselessOpCount++;
   }
 }
 
-function _deleteTextOp(id) {
+function _deleteOp(id) {
   return (dataStream) => {
-    dataStream.put_byte(OP_TYPE_DELETE_TEXT, null);
+    dataStream.put_byte(OP_TYPE_DELETE_ENTRY, null);
     dataStream.put_uint32(id, null);
     return true;
   };
@@ -426,26 +633,29 @@ function _moveToEndOp(id) {
 }
 
 function _appendBytesToLog(callback, priority) {
-  priority = priority || 0;
-  _pushToOpQueue((resolve) => {
-    const runUnsafe = () => {
-      _writeToStream(writeStream, priority, resolve, callback);
-    };
+  _pushToOpQueue((resolve) => _runLogAppend(resolve, callback, priority));
+}
 
-    if (writeStream === undefined) {
-      Gio.File.new_for_path(DATABASE_FILE).append_to_async(
-        Gio.FileCreateFlags.PRIVATE,
-        priority,
-        null,
-        (src, res) => {
-          writeStream = _intoDataStream(src.append_to_finish(res));
-          runUnsafe();
-        },
-      );
-    } else {
-      runUnsafe();
-    }
-  });
+/** Must be called from inside an op queue slot; calls `resolve` once the write is flushed. */
+function _runLogAppend(resolve, callback, priority) {
+  priority = priority || 0;
+  const runUnsafe = () => {
+    _writeToStream(writeStream, priority, resolve, callback);
+  };
+
+  if (writeStream === undefined) {
+    Gio.File.new_for_path(DATABASE_FILE).append_to_async(
+      Gio.FileCreateFlags.PRIVATE,
+      priority,
+      null,
+      (src, res) => {
+        writeStream = _intoDataStream(src.append_to_finish(res));
+        runUnsafe();
+      },
+    );
+  } else {
+    runUnsafe();
+  }
 }
 
 function _writeToStream(stream, priority, resolve, callback) {
