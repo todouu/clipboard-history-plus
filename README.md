@@ -14,9 +14,10 @@ Licensed under MIT; original copyright notices are kept in `LICENSE`.
 - The pointer-anchored menu is height-capped to the larger free side of the pointer so it flips
   above/below the pointer instead of covering the whole work area.
 
-Everything else is unchanged from upstream. The extension `uuid` is still
-`clipboard-history@alexsaveau.dev`, so it cannot be installed side by side with the upstream
-extension.
+Everything else is unchanged from upstream. The extension `uuid` is changed to
+`clipboard-history-plus@todou.local`, so the upstream extension (and its updates from
+extensions.gnome.org) cannot replace this fork. The settings schema id and dconf path are still the
+upstream ones, so both extensions share settings.
 
 ## Tips
 
@@ -35,28 +36,39 @@ extension.
   - <kbd>F</kbd> to (un)favorite a highlighted item.
 - Search uses case-insensitive [regex](https://regex101.com/?flavor=javascript).
 
+## Install from release
+
+Every push to `main` builds `clipboard-history-plus@todou.local.shell-extension.zip` (schemas
+already compiled) and publishes it as a GitHub release. No clone or `glib-compile-schemas` needed:
+
+```shell
+gh release download --repo todouu/clipboard-history-plus --pattern '*.zip' --dir /tmp --clobber
+gnome-extensions install --force /tmp/clipboard-history-plus@todou.local.shell-extension.zip
+gnome-extensions enable clipboard-history-plus@todou.local
+```
+
+Re-run the same commands to update, then restart GNOME Shell (see below). If the upstream
+`clipboard-history@alexsaveau.dev` is enabled, disable it first; both share one settings schema.
+
 ## Install from source
 
 Requires GNOME Shell 46 or newer (see `shell-version` in `metadata.json`), `git`, and
 `glib-compile-schemas` (package `libglib2.0-bin` on Ubuntu/Debian).
 
-This fork keeps the upstream `uuid` (`clipboard-history@alexsaveau.dev`), so the upstream extension
-must not be installed at the same time. If you have it, disable and remove it first:
+This fork uses its own `uuid` (`clipboard-history-plus@todou.local`), so it does not overwrite the
+upstream extension. Both share the same settings schema and dconf path, so keep only one of them
+enabled. If upstream is enabled, disable it first:
 
 ```shell
 gnome-extensions disable clipboard-history@alexsaveau.dev
-rm -rf ~/.local/share/gnome-shell/extensions/clipboard-history@alexsaveau.dev
 ```
-
-(Extensions installed system-wide under `/usr/share/gnome-shell/extensions/` have to be removed
-with your package manager instead.)
 
 Install this fork:
 
 ```shell
 git clone https://github.com/todouu/clipboard-history-plus.git \
-  ~/.local/share/gnome-shell/extensions/clipboard-history@alexsaveau.dev
-cd ~/.local/share/gnome-shell/extensions/clipboard-history@alexsaveau.dev
+  ~/.local/share/gnome-shell/extensions/clipboard-history-plus@todou.local
+cd ~/.local/share/gnome-shell/extensions/clipboard-history-plus@todou.local
 glib-compile-schemas schemas/
 ```
 
@@ -73,16 +85,16 @@ GNOME Shell only discovers newly installed extensions at startup:
 ### Enable
 
 ```shell
-gnome-extensions enable clipboard-history@alexsaveau.dev
+gnome-extensions enable clipboard-history-plus@todou.local
 ```
 
-Then open the extension settings (`gnome-extensions prefs clipboard-history@alexsaveau.dev`) and
-assign a key to "Toggle the menu at mouse pointer" if you want the pointer-anchored panel.
+Then open the extension settings (`gnome-extensions prefs clipboard-history-plus@todou.local`)
+and assign a key to "Toggle the menu at mouse pointer" if you want the pointer-anchored panel.
 
 ### Update
 
 ```shell
-cd ~/.local/share/gnome-shell/extensions/clipboard-history@alexsaveau.dev
+cd ~/.local/share/gnome-shell/extensions/clipboard-history-plus@todou.local
 git pull
 glib-compile-schemas schemas/
 ```
