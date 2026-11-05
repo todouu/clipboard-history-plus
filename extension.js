@@ -685,7 +685,15 @@ class ClipboardIndicator extends PanelMenu.Button {
             const width = pixbuf.get_width();
             const height = pixbuf.get_height();
             content = St.ImageContent.new_with_preferred_size(width, height);
+            // GNOME 48+ requires a Cogl context as the first argument.
+            const coglContext = [];
+            if (content.set_bytes.length === 6) {
+              coglContext.push(
+                global.stage.context.get_backend().get_cogl_context(),
+              );
+            }
             content.set_bytes(
+              ...coglContext,
               pixbuf.read_pixel_bytes(),
               pixbuf.get_has_alpha()
                 ? Cogl.PixelFormat.RGBA_8888
